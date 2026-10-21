@@ -32,6 +32,7 @@ UNIT_FILE=/etc/systemd/system/netautotune.service
 IFACE=""                    # пусто = определить автоматически
 SAMPLE_SEC=5                # шаг пассивного замера скорости интерфейса
 EVAL_SEC=600                # как часто пересчитывать (сек)
+START_DELAY_SEC=60          # первый цикл после старта демона
 PORT_CAP_MBIT=0             # жёсткий потолок по тарифу, Мбит/с (0 = не задан)
 NIC_SPEED_CAP=1             # учитывать /sys/class/net/IF/speed как потолок, если он известен
 DEFAULT_MBIT=1000           # тир, пока нет никаких данных
@@ -76,7 +77,7 @@ detect_iface() {
 
 init_state() {
     mkdir -p "$STATE_DIR" 2>/dev/null
-    STATE="$STATE_DIR/state"; LOG="$STATE_DIR/samples.log"
+    STATE="$STATE_DIR/state"; LOG="$STATE_DIR/samples.log"; LOCK="$STATE_DIR/lock"
     touch "$STATE" "$LOG" 2>/dev/null
 }
 
@@ -85,19 +86,20 @@ need_iface() {
     [[ -n $IFACE ]] || { echo "Не удалось определить интерфейс, задайте IFACE= в $CONF_FILE" >&2; exit 1; }
 }
 
+with_lock() { ( command -v flock >/dev/null && flock 9; "$@" ) 9>>"$LOCK"; }   # демон и CLI пишут в одни файлы
 state_get() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | tail -1; }
-state_set() {
+_state_write() {
     grep -v "^$1=" "$STATE" > "$STATE.tmp" 2>/dev/null
     echo "$1=$2" >> "$STATE.tmp"; mv "$STATE.tmp" "$STATE"
 }
+state_set() { with_lock _state_write "$@"; }
 
 # ----------------------------------------------------------- журнал наблюдений --------
 # строки: <epoch> <тип> <значение>;  P = пассивный пик (Мбит, уже с запасом), A = активный замер (Мбит), R = RTT (мс)
-add_sample() { echo "$(date +%s) $1 $2" >> "$LOG"; }
-prune_log() {
-    local cut=$(( $(date +%s) - LOG_KEEP_DAYS * 86400 ))
-    awk -v c="$cut" '$1>=c' "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
-}
+_log_append() { echo "$1" >> "$LOG"; }
+_log_prune() { awk -v c="$1" '$1>=c' "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"; }
+add_sample() { with_lock _log_append "$(date +%s) $1 $2"; }
+prune_log() { with_lock _log_prune $(( $(date +%s) - LOG_KEEP_DAYS * 86400 )); }
 
 # верхняя огибающая: максимумы по суткам, берём 2-й по величине (если дней >=4), иначе 1-й — устойчиво к выбросам
 envelope() {  # $1 тип, $2 окно в днях
@@ -111,7 +113,7 @@ max_recent() {  # $1 тип, $2 дней
 }
 rtt_design() {  # p80 по RTT-замерам за 7 дней; 0 если данных мало
     local since=$(( $(date +%s) - 7 * 86400 ))
-    awk -v s="$since" '$2=="R" && $1>=s {print $3}' "$LOG" | sort -n \
+    awk -v s="$since" '$2=="R" && $1>=s && $3<=2000 {print $3}' "$LOG" | sort -n \
       | awk '{a[NR]=$1} END{ if(NR<12){print 0; exit} i=int(NR*0.8); if(i<1)i=1; print a[i] }'
 }
 
@@ -120,18 +122,22 @@ read_bytes() {  # "rx tx" байт интерфейса
     awk -v i="$IFACE" '{sub(/:/," ")} $1==i {print $2, $10}' /proc/net/dev
 }
 
-sample_tick() {
-    local rx tx d1 d2 m
+sample_tick() {  # скорость за реально прошедшее время; при задержках цикла выборка отбрасывается
+    local rx tx d1 d2 m now dt
     read -r rx tx < <(read_bytes)
     [[ -n ${rx:-} ]] || return
+    now=$(now_ms)
     if [[ -n ${PRX:-} ]]; then
-        d1=$(( rx - PRX )); d2=$(( tx - PTX ))
-        (( d1 < 0 )) && d1=0; (( d2 < 0 )) && d2=0
-        (( d2 > d1 )) && d1=$d2
-        m=$(( d1 * 8 / SAMPLE_SEC / 1000000 ))
-        (( m > PEAK )) && PEAK=$m
+        dt=$(( now - PT ))
+        if (( dt >= 1000 && dt <= 3 * SAMPLE_SEC * 1000 )); then
+            d1=$(( rx - PRX )); d2=$(( tx - PTX ))
+            (( d1 < 0 )) && d1=0; (( d2 < 0 )) && d2=0
+            (( d2 > d1 )) && d1=$d2
+            m=$(( d1 * 8 / (dt * 1000) ))
+            (( m > PEAK )) && PEAK=$m
+        fi
     fi
-    PRX=$rx; PTX=$tx
+    PRX=$rx; PTX=$tx; PT=$now
 }
 
 # RTT и скорость потоков реальных клиентов (бесплатно, из ядра)
@@ -148,12 +154,12 @@ flow_sample() {  # печатает: "<rtt_p90_ms|-> <max_flow_mbit>"
             if (match($0,/bytes_received:[0-9]+/))   vol+=substr($0,RSTART+15,RLENGTH-15)
             if (match($0,/delivery_rate [0-9.]+[KMG]?bps/)) { x=rate(substr($0,RSTART+14,RLENGTH-14)); if(x>bw) bw=x }
             if (match($0,/bbr:\(bw:[0-9.]+[KMG]?bps/))      { x=rate(substr($0,RSTART+8,RLENGTH-8));  if(x>bw) bw=x }
-            if (rtt>0 && vol>=10000) print "R", rtt
+            if (rtt>0 && rtt<=2000 && vol>=10000) print "R", rtt
             if (bw>mx) mx=bw
         }
         END { printf "B %d\n", mx }')
     local rtt bw
-    rtt=$(awk '$1=="R"{print $2}' <<<"$out" | sort -n | awk '{a[NR]=$1} END{ if(NR>=5){i=int(NR*0.9+0.5); if(i<1)i=1; printf "%d", a[i]+0.5} else printf "-" }')
+    rtt=$(awk '$1=="R"{print $2}' <<<"$out" | sort -n | awk '{a[NR]=$1} END{ if(NR>=10){i=int(NR*0.9+0.5); if(i<1)i=1; printf "%d", a[i]+0.5} else printf "-" }')
     bw=$(awk '$1=="B"{print $2}' <<<"$out"); echo "$rtt ${bw:-0}"
 }
 
@@ -288,7 +294,7 @@ should_calibrate() {
 }
 
 do_calibrate() {
-    local res best used u
+    local best used u
     state_set last_attempt "$(date +%s)"
     read -r best used < <(active_test)
     u=$(state_get used_mb); u=${u:-0}; state_set used_mb $(( u + used ))
@@ -346,6 +352,11 @@ decide() {  # $1 = 1 сохранить состояние; задаёт TIER, R
 }
 
 # ------------------------------------------------------------------ генерация sysctl --
+ipv6_needed() {  # IPv6 — единственный путь управления: нет IPv4-маршрута по умолчанию или есть SSH-сессия по IPv6
+    if ip -6 route show default 2>/dev/null | grep -q . && ! ip -4 route show default 2>/dev/null | grep -q .; then return 0; fi
+    ss -t6 state established '( sport = :22 )' 2>/dev/null | awk 'NR>1 && $4 !~ /^\[::1\]/ {f=1} END{exit !f}'
+}
+
 have_bbr() {
     grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && return 0
     [[ $DRY_RUN == 1 ]] || modprobe tcp_bbr 2>/dev/null
@@ -353,6 +364,10 @@ have_bbr() {
 }
 
 clamp() { local v=$1 lo=$2 hi=$3; (( v < lo )) && v=$lo; (( v > hi )) && v=$hi; echo "$v"; }
+
+calc_conntrack() {  # $1 = RAM в МБ -> nf_conntrack_max (hashsize = max/4)
+    local c; c=$(clamp $(( $1 * 64 )) 32768 2097152); echo $(( (c + 4095) / 4096 * 4096 ))
+}
 
 render() {  # $1 тир (Мбит), $2 RTT (мс)
     local tier=$1 rtt=$2 ram_kb pgsz pages ram_mb buf hi bl ct minfree filemax
@@ -367,7 +382,7 @@ render() {  # $1 тир (Мбит), $2 RTT (мс)
     buf=$(( buf / 1048576 * 1048576 )); (( buf < 8388608 )) && buf=8388608
 
     bl=$(clamp $(( tier * 16 )) 4096 65536)
-    ct=$(clamp $(( ram_mb * 64 )) 32768 2097152); ct=$(( (ct + 4095) / 4096 * 4096 ))
+    ct=$(calc_conntrack "$ram_mb")
     minfree=$(clamp $(( ram_kb / 100 )) 8192 131072)
     filemax=$(clamp $(( ram_mb * 256 )) 65536 4194304)
 
@@ -429,7 +444,9 @@ render() {  # $1 тир (Мбит), $2 RTT (мс)
     echo "net.ipv4.conf.all.accept_source_route = 0"
     echo "net.ipv4.conf.default.accept_source_route = 0"
     (( ICMP_IGNORE )) && echo "net.ipv4.icmp_echo_ignore_all = 1"
-    if (( DISABLE_IPV6 )); then
+    if (( DISABLE_IPV6 )) && ipv6_needed; then
+        echo; echo "# IPv6 НЕ отключён: по нему идёт управление нодой (нет IPv4-маршрута или есть SSH-сессия по IPv6)"
+    elif (( DISABLE_IPV6 )); then
         echo
         echo "# --- IPv6 выключен ---"
         echo "net.ipv6.conf.all.disable_ipv6 = 1"
@@ -441,13 +458,11 @@ render() {  # $1 тир (Мбит), $2 RTT (мс)
     echo "vm.min_free_kbytes = $minfree"
     echo "vm.vfs_cache_pressure = 50"
     echo "fs.file-max = $filemax"
-    CT_HASH=$(( ct / 4 ))
 }
 
 apply_conntrack_hash() {
-    local h=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 * 64 ))
-    h=$(clamp "$h" 32768 2097152); h=$(( (h + 4095) / 4096 * 4096 / 4 ))
     [[ -d /sys/module/nf_conntrack ]] || return 0
+    local h=$(( $(calc_conntrack "$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)") / 4 ))
     [[ -w /sys/module/nf_conntrack/parameters/hashsize ]] && echo "$h" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null
     echo "options nf_conntrack hashsize=$h" > "$CT_MODPROBE"
 }
@@ -490,10 +505,10 @@ cycle() {
 cmd_daemon() {
     need_iface; init_state
     trap 'log "остановка"; exit 0' TERM INT
-    PEAK=0; PRX=""; PTX=""
+    PEAK=0; PRX=""; PTX=""; PT=0
     log "старт: интерфейс=$IFACE, пересчёт каждые ${EVAL_SEC}с"
     decide 1; apply_conf "$TIER" "$RTT" 1          # на старте всегда восстанавливаем конфиг
-    local next=$(( $(date +%s) + 60 ))             # первый цикл через минуту после старта
+    local next=$(( $(date +%s) + START_DELAY_SEC ))
     while :; do
         sleep "$SAMPLE_SEC"
         sample_tick
@@ -516,7 +531,7 @@ cmd_status() {
     need_iface; init_state; decide 0
     local cur used la
     cur=$(state_get tier); used=$(state_get used_mb); la=$(state_get last_active)
-    echo "интерфейс:         $IFACE (NIC speed: $(cat /sys/class/net/$IFACE/speed 2>/dev/null || echo n/a))"
+    echo "интерфейс:         $IFACE (NIC speed: $(cat "/sys/class/net/$IFACE/speed" 2>/dev/null || echo n/a))"
     echo "применённый тир:   ${cur:-—} Мбит"
     echo "расчётный тир:     $TIER Мбит   ($EST_INFO)"
     echo "расчётный RTT:     $RTT мс   (замеров RTT за 7д: $(awk -v s=$(( $(date +%s) - 604800 )) '$2=="R"&&$1>=s' "$LOG" | wc -l))"
@@ -536,7 +551,8 @@ cmd_render() {
 
 cmd_install() {
     [[ $EUID -eq 0 ]] || { echo "Нужен root" >&2; exit 1; }
-    install -m 755 "$(readlink -f "$0")" "$SELF_BIN"
+    local src; src=$(readlink -f "$0")
+    [[ $src == "$(readlink -f "$SELF_BIN")" ]] || install -m 755 "$src" "$SELF_BIN"
     if [[ ! -f $CONF_FILE ]]; then
         cat > "$CONF_FILE" <<EOF
 # Конфиг netautotune. Раскомментируйте и измените нужное.
@@ -567,7 +583,7 @@ Nice=10
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload && systemctl enable --now netautotune.service
+    systemctl daemon-reload && systemctl enable netautotune.service && systemctl restart netautotune.service
     echo "Установлено. Проверка: netautotune status ; логи: journalctl -u netautotune -f"
 }
 
@@ -594,15 +610,19 @@ netautotune $VERSION
 EOF
 }
 
-cmd=${1:-help}; shift || true
-case $cmd in
-    install)   cmd_install ;;
-    uninstall) cmd_uninstall ;;
-    daemon)    cmd_daemon ;;
-    eval)      cmd_eval ;;
-    calibrate) cmd_calibrate ;;
-    status)    cmd_status ;;
-    render)    cmd_render "$@" ;;
-    export)    cmd_export ;;
-    *)         usage ;;
-esac
+main() {
+    local cmd=${1:-help}; shift || true
+    case $cmd in
+        install)   cmd_install ;;
+        uninstall) cmd_uninstall ;;
+        daemon)    cmd_daemon ;;
+        eval)      cmd_eval ;;
+        calibrate) cmd_calibrate ;;
+        status)    cmd_status ;;
+        render)    cmd_render "$@" ;;
+        export)    cmd_export ;;
+        *)         usage ;;
+    esac
+}
+
+[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"
